@@ -5,3 +5,4 @@ mediapipe
 cryptography
 Pillow
 numpy
+python-dotenv

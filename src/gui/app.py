@@ -19,6 +19,7 @@ from services.logger_service import LoggerService
 from services.alert_service import AlertService
 from services.watermark_service import WatermarkService
 from services.cloud_service import CloudService
+from services.sound_service import SoundService
 
 # SOC STYLE COLORS
 C_GREEN = "#00FF9C"
@@ -38,17 +39,14 @@ class SmartAccessApp(ctk.CTk):
 
         # Initialize Services
         self.camera = CameraService()
-        self.face_service = FaceService()
         self.access_service = AccessService()
+        self.face_service = FaceService()
         self.logger_service = LoggerService()
         self.watermark_service = WatermarkService()
         self.cloud_service = CloudService()
+        self.sound_service = SoundService()
         
-        self.alert_service = AlertService(
-            sender_email="removed@example.com", 
-            sender_password="REMOVED_SECRET", 
-            receiver_email="removed@example.com"
-        )
+        self.alert_service = AlertService()
 
         # Performance Stats
         self.fps_deque = deque(maxlen=30)
@@ -63,6 +61,8 @@ class SmartAccessApp(ctk.CTk):
         self.last_log_refresh = 0
         self.last_alarm_time = 0
         self.is_capturing = False
+        self.enrollment_step = 0
+        self.countdown_val = 0
         self.capture_count = 0
         self.max_samples = 50
 
@@ -145,11 +145,30 @@ class SmartAccessApp(ctk.CTk):
         self.role_var = ctk.StringVar(value="authorized")
         ctk.CTkOptionMenu(self.register_frame, values=["authorized", "restricted"], variable=self.role_var, width=300).pack(pady=10)
         
-        ctk.CTkButton(self.register_frame, text="START CAPTURE", fg_color=C_GREEN, text_color="#000", font=("Inter", 13, "bold"),
-                     command=self.start_face_capture).pack(pady=30)
+        self.reg_btn = ctk.CTkButton(self.register_frame, text="START ENROLLMENT", fg_color=C_GREEN, text_color="#000", 
+                                    font=("Inter", 13, "bold"), command=self.start_face_capture)
+        self.reg_btn.pack(pady=20)
         
+        # Instruction Panel
+        self.instr_frame = ctk.CTkFrame(self.register_frame, fg_color=C_PANEL, corner_radius=10)
+        self.instr_frame.pack(pady=10, padx=40, fill="x")
+        
+        instructions = [
+            "1. Face the camera directly during the countdown.",
+            "2. Follow on-screen instructions (Look front, tilt left/right).",
+            "3. Ensure good lighting for better recognition accuracy."
+        ]
+        for instr in instructions:
+            ctk.CTkLabel(self.instr_frame, text=instr, font=("Inter", 11), text_color="#AAA").pack(anchor="w", padx=20, pady=2)
+
         self.reg_status = ctk.CTkLabel(self.register_frame, text="Ready")
-        self.reg_status.pack()
+        self.reg_status.pack(pady=10)
+
+        ctk.CTkButton(self.register_frame, text="SYNC FROM CLOUD", fg_color=C_ORANGE, text_color="#000", font=("Inter", 13, "bold"),
+                     command=self.sync_from_cloud).pack(pady=5)
+
+        ctk.CTkButton(self.register_frame, text="RESET LOCAL SYSTEM", fg_color="transparent", border_width=1, border_color=C_RED, 
+                     text_color=C_RED, font=("Inter", 11), command=self.reset_system).pack(pady=10)
 
         # Logs History Frame
         self.history_frame = ctk.CTkFrame(self, fg_color=C_BG)
@@ -244,8 +263,8 @@ class SmartAccessApp(ctk.CTk):
             current_color = (255, 212, 0) # Default Blue-ish BGR
             status_text = "SCANNING..."
             
-            # 4. Recognition Logic
-            if len(faces) > 0:
+            # 4. Recognition Logic (Skip if capturing)
+            if len(faces) > 0 and not self.is_capturing:
                 status_text, current_color = self._process_recognition(frame, faces[0], gray, blinked)
                 
                 # Draw stylized box if mesh is off
@@ -315,12 +334,14 @@ class SmartAccessApp(ctk.CTk):
             ui_color = C_RED
             msg = f"{pulse}ALERT: IMPOSTOR DETECTED!{pulse}"
             log_action = "DENIED (IMPOSTOR)"
+            self.sound_service.play_siren(1) # Immediate short siren
             self._trigger_unauthorized_alert(frame, rect, smoothed_name, conf, True)
         else:
             color = (0, 165, 255) # Orange BGR
             ui_color = C_ORANGE
             msg = f"⚠ DENIED: {smoothed_name.upper()} (RESTRICTED)"
             log_action = "DENIED (RESTRICTED)"
+            self.sound_service.play_siren(1) # Immediate short siren
             self._trigger_unauthorized_alert(frame, rect, smoothed_name, conf, False)
 
         self.detection_label.configure(text=f"[{spoof_status}] {msg}", text_color=ui_color)
@@ -331,7 +352,10 @@ class SmartAccessApp(ctk.CTk):
             # Sync to local DB, JSON, and Cloud
             self.access_service.log_event(smoothed_name, msg, conf, log_action)
             self.logger_service.log_access(smoothed_name, status, conf, log_action)
-            self.cloud_service.log_access_event(smoothed_name, status, conf, log_action)
+            
+            # Background cloud logging
+            threading.Thread(target=self.cloud_service.log_access_event, 
+                             args=(smoothed_name, status, conf, log_action), daemon=True).start()
             
             # Watermark embedding confirmation in logs
             self._update_side_logs(smoothed_name, log_action)
@@ -342,15 +366,44 @@ class SmartAccessApp(ctk.CTk):
     def _handle_enrollment(self, frame, face, gray):
         x, y, w, h = face
         self.capture_count += 1
+        
+        # Step-by-step guidance
+        instr = "LOOK FRONT"
+        if self.capture_count > 35:
+            instr = "TILT RIGHT"
+            self.enrollment_step = 3
+        elif self.capture_count > 15:
+            instr = "TILT LEFT"
+            self.enrollment_step = 2
+        else:
+            self.enrollment_step = 1
+
         img_path = f"dataset/{self.current_reg_name}.{self.current_reg_id}.{self.capture_count}.jpg"
         cv2.imwrite(img_path, gray[y:y+h, x:x+w])
-        self.cloud_service.upload_biometric_sample(self.current_reg_id, img_path)
         
-        self.reg_status.configure(text=f"PROGRESS: {self.capture_count}/{self.max_samples}")
+        # Upload in background
+        threading.Thread(target=self.cloud_service.upload_biometric_sample, 
+                         args=(self.current_reg_id, img_path), daemon=True).start()
+        
+        # Visual feedback on UI
+        progress = int((self.capture_count / self.max_samples) * 100)
+        self.reg_status.configure(text=f"STEP {self.enrollment_step}: {instr} ({progress}%)", text_color=C_GREEN)
+        self.detection_label.configure(text=f"CAPTURING... {instr} [{progress}%]", text_color=C_GREEN)
+
         if self.capture_count >= self.max_samples:
             self.is_capturing = False
-            self.face_service.train()
+            self.enrollment_step = 0
+            self.reg_status.configure(text="STATUS: UPLOADING & TRAINING...", text_color=C_ORANGE)
+            threading.Thread(target=self._run_training, daemon=True).start()
             self.show_frame("dashboard")
+
+    def _run_training(self):
+        """Background task for training."""
+        self.reg_status.configure(text="STATUS: TRAINING MODEL...")
+        if self.face_service.train():
+            print("[OK] Model training complete and refreshed.")
+        else:
+            print("[FAIL] Model training failed.")
 
     def _trigger_unauthorized_alert(self, frame, rect, name, conf, is_impostor):
         curr_time = time.time()
@@ -374,7 +427,12 @@ class SmartAccessApp(ctk.CTk):
             wm_hash = self.watermark_service.generate_hash(watermark_text)[:16]
             watermarked_crop = self.watermark_service.embed_watermark(crop, wm_hash)
             
+            # Save for audit verification
+            capture_filename = f"data/captures/{name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            cv2.imwrite(capture_filename, watermarked_crop)
+            
             threading.Thread(target=self.alert_service.send_alert, args=(name, conf, timestamp, watermarked_crop, is_impostor)).start()
+            self.sound_service.play_siren(3) # Longer siren for full alert
             self.last_alert_time[name] = curr_time
             
             self.alert_box.configure(text=f"🚨 SECURITY ALERT: {name} - EMAIL SENT", fg_color=C_RED, text_color="#FFF")
@@ -390,12 +448,51 @@ class SmartAccessApp(ctk.CTk):
         name = self.name_entry.get().strip()
         if not name: return
         self.current_reg_name = name
-        self.current_reg_id = self.access_service.get_next_user_id()
-        if self.access_service.add_user(name):
-            self.cloud_service.upload_user_data(self.current_reg_id, name, self.role_var.get())
+        
+        # Check if user already exists
+        existing_id = self.access_service.get_user_id(name)
+        if existing_id:
+            self.current_reg_id = existing_id
+        else:
+            self.current_reg_id = self.access_service.get_next_user_id()
+            self.access_service.add_user(name, self.role_var.get())
+            
+        # Background cloud sync
+        threading.Thread(target=self.cloud_service.upload_user_data, 
+                         args=(self.current_reg_id, name, self.role_var.get()), daemon=True).start()
+        
+        self.countdown_val = 3
+        self.reg_btn.configure(state="disabled")
+        self._run_countdown()
+
+    def _run_countdown(self):
+        if self.countdown_val > 0:
+            self.reg_status.configure(text=f"PREPARING... {self.countdown_val}", text_color=C_ORANGE)
+            self.countdown_val -= 1
+            self.after(1000, self._run_countdown)
+        else:
             self.is_capturing = True
             self.capture_count = 0
+            self.enrollment_step = 1
             self.show_frame("dashboard")
+            self.reg_btn.configure(state="normal")
+            self.reg_status.configure(text="SYSTEM READY", text_color=C_BLUE)
+
+    def sync_from_cloud(self):
+        """Triggers background sync from cloud."""
+        self.reg_status.configure(text="STATUS: CONNECTING TO CLOUD...")
+        threading.Thread(target=self._run_sync, daemon=True).start()
+
+    def _run_sync(self):
+        """Background task for cloud sync and training."""
+        sync_count = self.cloud_service.sync_dataset_from_cloud(access_service=self.access_service)
+        if sync_count > 0:
+            self.reg_status.configure(text=f"STATUS: SYNC OK ({sync_count} SAMPLES)! TRAINING...", text_color=C_GREEN)
+            self._run_training()
+        elif sync_count == 0:
+            self.reg_status.configure(text="STATUS: NO SAMPLES ON CLOUD", text_color=C_ORANGE)
+        else:
+            self.reg_status.configure(text="STATUS: SYNC FAILED (CONNECTION ERROR)", text_color=C_RED)
 
     def refresh_logs(self):
         self.history_textbox.delete("1.0", "end")
@@ -414,6 +511,33 @@ class SmartAccessApp(ctk.CTk):
             data = self.watermark_service.extract_watermark(img)
             if data: messagebox.showinfo("SOC Audit", f"Integrity Verified!\n\n{data}")
             else: messagebox.showerror("SOC Audit", "Tampering Detected or No Watermark!")
+
+    def reset_system(self):
+        """Purges local database, model, and dataset to fix desync with cloud."""
+        from tkinter import messagebox
+        if not messagebox.askyesno("SOC Security", "CRITICAL: This will delete all local biometric data and reset the model.\n\nProceed?"):
+            return
+            
+        try:
+            # 1. Close camera to prevent locks
+            self.camera.release()
+            
+            # 2. Delete files
+            paths = ["trainer.yml", "data/access_control.db", "dataset/*", "data/access_logs.json"]
+            import shutil
+            import glob
+            
+            for p in paths:
+                if "*" in p:
+                    for f in glob.glob(p): os.remove(f)
+                elif os.path.exists(p):
+                    os.remove(p)
+            
+            messagebox.showinfo("SOC Security", "Local data purged. System will now restart.")
+            # 3. Restart process
+            os.execv(sys.executable, ['python'] + sys.argv)
+        except Exception as e:
+            messagebox.showerror("Error", f"Reset failed: {e}")
 
     def on_closing(self):
         self.camera.release()

@@ -1,18 +1,22 @@
 import smtplib
 import cv2
+import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class AlertService:
     def __init__(self, smtp_server="smtp.gmail.com", port=587, 
                  sender_email=None, sender_password=None, receiver_email=None):
         self.smtp_server = smtp_server
         self.port = port
-        self.sender_email = sender_email
-        self.sender_password = sender_password
-        self.receiver_email = receiver_email
-        self.enabled = all([sender_email, sender_password, receiver_email])
+        self.sender_email = sender_email or os.getenv("SENDER_EMAIL")
+        self.sender_password = sender_password or os.getenv("SENDER_PASSWORD")
+        self.receiver_email = receiver_email or os.getenv("RECEIVER_EMAIL")
+        self.enabled = all([self.sender_email, self.sender_password, self.receiver_email])
 
     def send_alert(self, user_id, confidence, timestamp, face_image=None, is_impostor=False):
         """Sends an alert with an optional face image attachment."""

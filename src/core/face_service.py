@@ -23,6 +23,10 @@ class FaceService:
         # 2. Recognizer Initialization
         self.recognizer = cv2.face.LBPHFaceRecognizer_create()
         self.model_path = model_path
+        
+        # Ensure dataset directory exists
+        os.makedirs("dataset", exist_ok=True)
+        
         self.load_users_from_db()
         
         if os.path.exists(self.model_path):
@@ -115,14 +119,17 @@ class FaceService:
         try:
             label, confidence = self.recognizer.predict(face_roi)
             # LBPH confidence is a distance; lower is better. 
-            # We normalize it to a 0-1 scale.
-            norm_confidence = max(0, 1 - (confidence / 120.0))
+            # 0 is a perfect match, > 100 is usually poor.
+            norm_confidence = max(0, 1 - (confidence / 150.0))
             
             name = self.known_users.get(label, "Unknown")
             role = self.known_roles.get(label, "impostor")
             
-            # Adaptive thresholding: higher confidence needed for restricted areas
-            threshold = 0.65 if role == "authorized" else 0.75
+            # Debug log
+            print(f"[DEBUG] Recognizer: Label={label}, Name={name}, Dist={round(confidence, 2)}, NormConf={round(norm_confidence, 2)}")
+            
+            # Adjusted threshold: 0.5 is more permissive for diverse lighting
+            threshold = 0.50
             status = "recognized" if name != "Unknown" and norm_confidence > threshold else "unknown"
             
             # LBP Texture Check (Anti-Spoofing Proxy)
@@ -224,16 +231,26 @@ class FaceService:
                     user_id = int(filename.split('.')[1])
                 except: continue
                 
-                # Use cascade for training data extraction (legacy compatibility)
+                # Use cascade for training data extraction
                 faces = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml').detectMultiScale(img)
-                for (x, y, w, h) in faces:
-                    roi = cv2.equalizeHist(img[y:y+h, x:x+w])
+                
+                if len(faces) == 0:
+                    # If no face detected, assume the image is already a face crop (as done in enrollment)
+                    roi = cv2.equalizeHist(img)
                     roi = cv2.GaussianBlur(roi, (3, 3), 0)
                     face_samples.append(roi)
                     ids.append(user_id)
+                else:
+                    for (x, y, w, h) in faces:
+                        roi = cv2.equalizeHist(img[y:y+h, x:x+w])
+                        roi = cv2.GaussianBlur(roi, (3, 3), 0)
+                        face_samples.append(roi)
+                        ids.append(user_id)
                     
         if len(face_samples) > 0:
             self.recognizer.train(face_samples, np.array(ids))
             self.recognizer.save(self.model_path)
+            # Refresh user mapping from DB
+            self.load_users_from_db()
             return True
         return False

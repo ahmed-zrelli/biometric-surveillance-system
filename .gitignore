@@ -5,8 +5,6 @@ dataset/
 firebase-key.json
 secret.key
 trainer.yml
-.zencoder/
-.zenflow/
 .vscode/
 .idea/
 *.log
