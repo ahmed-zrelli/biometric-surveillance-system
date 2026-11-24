@@ -8,3 +8,6 @@ trainer.yml
 .vscode/
 .idea/
 *.log
+
+# Secrets: copy .env.example to .env and fill in your own values
+.env
